@@ -1,3 +1,5 @@
+![Transaction Ledger: money is never created, lost, or applied twice](assets/banner.png)
+
 # Transaction Ledger API
 
 A small HTTP service that keeps account balances and records every movement of money
