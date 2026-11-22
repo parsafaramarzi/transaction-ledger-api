@@ -392,3 +392,139 @@ def list_transactions(
     page = [_transaction_from_row(row) for row in rows[:limit]]
     next_cursor = page[-1].id if len(rows) > limit else None
     return page, next_cursor
+
+
+# --------------------------------------------------------------------------- #
+# Reporting: join, window function, query plan, reconciliation                #
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class StatementEntry:
+    transaction_id: int
+    transaction_type: TransactionType
+    amount: int
+    change: int  # signed effect on this account: +amount when money came in, -amount when out
+    balance_after: int
+    counterparty_id: int | None
+    counterparty_name: str | None
+    timestamp: str
+
+
+# One row per transaction touching :account, with its signed effect on that account and who
+# was on the other side. Both predicates are indexed (idx_transactions_source/destination).
+_ACCOUNT_ENTRIES_SQL = """
+    SELECT t.id, t.transaction_type, t.amount, t.timestamp,
+           CASE WHEN t.account_destination = :account THEN t.amount ELSE -t.amount END AS change,
+           CASE WHEN t.account_source = :account THEN t.account_destination
+                ELSE t.account_source END AS counterparty_id
+    FROM transactions AS t
+    WHERE t.account_source = :account OR t.account_destination = :account
+"""
+
+# The running balance is a window function: SUM(change) over the account's history in id order.
+# Order of operations matters: the window runs over the account's whole history FIRST, and only
+# then do the cursor filter and LIMIT cut out the page. Cutting the page first (LIMIT before the
+# window) would restart the running total at the top of each page and give wrong balances.
+# The price is that a page costs O(history), the cost of an always-correct running balance.
+_STATEMENT_SQL = f"""
+    WITH entries AS ({_ACCOUNT_ENTRIES_SQL}),
+    running AS (
+        SELECT entries.*,
+               SUM(change) OVER (
+                   ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+               ) AS balance_after
+        FROM entries
+    )
+    SELECT r.id, r.transaction_type, r.amount, r.timestamp, r.change, r.balance_after,
+           r.counterparty_id, a.name AS counterparty_name
+    FROM running AS r
+    LEFT JOIN accounts AS a ON a.id = r.counterparty_id
+    WHERE (:cursor IS NULL OR r.id < :cursor)
+    ORDER BY r.id DESC
+    LIMIT :limit_plus_one
+"""
+
+
+def get_statement(
+    account_id: int, *, limit: int = 10, cursor: int | None = None
+) -> tuple[list[StatementEntry], int | None]:
+    """Newest-first page of an account's statement, each line with its running balance.
+
+    ``cursor`` / ``next_cursor`` work exactly like :func:`list_transactions`.
+    """
+    with connection() as conn:
+        rows = conn.execute(
+            _STATEMENT_SQL,
+            {"account": account_id, "cursor": cursor, "limit_plus_one": limit + 1},
+        ).fetchall()
+    page = [
+        StatementEntry(
+            transaction_id=row["id"],
+            transaction_type=row["transaction_type"],
+            amount=row["amount"],
+            change=row["change"],
+            balance_after=row["balance_after"],
+            counterparty_id=row["counterparty_id"],
+            counterparty_name=row["counterparty_name"],
+            timestamp=row["timestamp"],
+        )
+        for row in rows[:limit]
+    ]
+    next_cursor = page[-1].transaction_id if len(rows) > limit else None
+    return page, next_cursor
+
+
+def explain_account_entries(account_id: int) -> list[str]:
+    """SQLite's query plan for finding an account's transactions (one line per step).
+
+    ``SEARCH ... USING INDEX`` is good; ``SCAN transactions`` means a full table scan.
+    """
+    with connection() as conn:
+        rows = conn.execute(
+            "EXPLAIN QUERY PLAN " + _ACCOUNT_ENTRIES_SQL, {"account": account_id}
+        ).fetchall()
+    return [str(row["detail"]) for row in rows]
+
+
+_RECONCILE_TOTALS_SQL = """
+    SELECT
+        (SELECT COALESCE(SUM(balance), 0) FROM accounts) AS held,
+        (SELECT COALESCE(SUM(CASE transaction_type
+                                 WHEN 'deposit' THEN amount
+                                 WHEN 'withdraw' THEN -amount
+                                 ELSE 0 END), 0) FROM transactions) AS expected
+"""
+
+# An account's balance must equal the sum of the signed effects of its transactions.
+# A join + GROUP BY + HAVING returns only the accounts where it does not.
+_RECONCILE_ACCOUNTS_SQL = """
+    SELECT a.id, a.balance,
+           COALESCE(SUM(CASE WHEN t.account_destination = a.id THEN t.amount
+                             ELSE -t.amount END), 0) AS ledger_balance
+    FROM accounts AS a
+    LEFT JOIN transactions AS t ON t.account_source = a.id OR t.account_destination = a.id
+    GROUP BY a.id, a.balance
+    HAVING a.balance != ledger_balance
+    ORDER BY a.id
+"""
+
+
+def reconcile() -> list[str]:
+    """Check the books. Returns human-readable problems; an empty list means all is consistent.
+
+    Two invariants: money held by all accounts equals deposits minus withdrawals (transfers
+    only move money), and every account's balance equals what its own history adds up to.
+    """
+    problems: list[str] = []
+    with connection() as conn:
+        totals = conn.execute(_RECONCILE_TOTALS_SQL).fetchone()
+        if totals["held"] != totals["expected"]:
+            problems.append(
+                f"accounts hold {totals['held']} but deposits minus withdrawals is "
+                f"{totals['expected']}"
+            )
+        for row in conn.execute(_RECONCILE_ACCOUNTS_SQL):
+            problems.append(
+                f"account {row['id']} holds {row['balance']} but its transactions add up to "
+                f"{row['ledger_balance']}"
+            )
+    return problems

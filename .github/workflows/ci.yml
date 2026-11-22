@@ -39,6 +39,41 @@ jobs:
       - name: Tests
         run: pytest
 
+  ops:
+    name: Shell scripts and load test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: pip install -e .
+
+      - name: shellcheck
+        run: shellcheck -x scripts/*.sh
+
+      - name: Load test against a real server, then reconcile the books
+        env:
+          LEDGER_DB_PATH: ${{ runner.temp }}/ledger.db
+        run: |
+          python -m uvicorn ledger.api:app --port 8000 &
+          server=$!
+          for _ in $(seq 1 50); do
+            curl -sf localhost:8000/docs > /dev/null && break
+            sleep 0.2
+          done
+          bash scripts/load_test.sh
+          python -m ledger.reconcile
+          kill -TERM "$server"
+
+      - name: Graceful shutdown demo (real signals)
+        run: bash scripts/graceful_shutdown_demo.sh
+
   docker:
     name: Docker image builds
     runs-on: ubuntu-latest

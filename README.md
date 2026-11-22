@@ -66,6 +66,7 @@ curl "localhost:8000/transactions/?account_id=1&limit=10"
 | `POST` | `/accounts/` | Create an account. Body: `{"name": "..."}`. The server assigns the id; the balance starts at `0`. → `201` |
 | `GET` | `/accounts/{id}` | An account and its current balance. → `200` / `404` |
 | `POST` | `/transactions/` | Create a transaction. Requires the `Idempotency-Key` header. → `201` / `200` (replay) |
+| `GET` | `/accounts/{id}/statement` | The account's transactions, newest first, each with its signed `change`, the `balance_after`, and the other party's name. Query: `limit`, `cursor` |
 | `GET` | `/transactions/{id}` | One transaction. → `200` / `404` |
 | `GET` | `/transactions/` | Newest-first page of transactions. Query: `account_id`, `limit` (1–100, default 10), `cursor` |
 
@@ -131,6 +132,70 @@ transaction opened with `BEGIN IMMEDIATE`**:
 - The schema backs this up even if application code has a bug: `CHECK (balance >= 0)`,
   `CHECK (amount > 0)`, `UNIQUE (idempotency_key)`, and foreign keys on both accounts.
 
+## Account statements (SQL)
+
+`GET /accounts/{id}/statement` is built from three SQL techniques, all in `ledger/db.py`:
+
+- a **window function**, `SUM(change) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`,
+  gives the running balance after each transaction;
+- a **`LEFT JOIN`** to `accounts` supplies the other party's name (null for deposits and withdrawals);
+- the cursor filter and `LIMIT` are applied *after* the window, so `balance_after` is right on every page.
+  (Cutting the page first would restart the running total at the top of each page.)
+
+The query that finds an account's transactions is served by `idx_transactions_source` and
+`idx_transactions_destination`. `ledger.db.explain_account_entries(id)` returns SQLite's query plan
+(`SEARCH ... USING INDEX` is good, `SCAN` is a full table scan), and a test asserts the plan, and that it
+changes to a scan when the indexes are dropped.
+
+`python -m ledger.reconcile` checks the books with a join, `GROUP BY` and `HAVING`: total money held must
+equal deposits minus withdrawals, and each account's balance must equal what its own transactions add up
+to. Exit status `0` = consistent, `1` = mismatch (printed to stderr), `2` = could not run.
+
+## Python client
+
+`ledger_client` is a small client for the API (`pip install -e ".[client]"` pulls in `httpx`). It is also a
+tour of three Python features, each tested:
+
+```python
+from ledger_client import LedgerClient, AsyncLedgerClient, TransferRequest
+
+with LedgerClient("http://localhost:8000") as api:
+    alice = api.create_account("Alice")
+    api.create_transaction("deposit", 1000, destination_id=alice.id)
+
+    for tx in api.iter_transactions(alice.id):  # a generator: pages are fetched lazily
+        print(tx.id, tx.transaction_type, tx.amount)
+```
+
+- **Generator:** `iter_transactions` follows `next_cursor` and yields one transaction at a time. Nothing is
+  requested until you iterate, and only one page is in memory however long the history is.
+- **Decorator:** `retry_on_busy` (and `async_retry_on_busy`) retry a call on a `503`, honouring `Retry-After`
+  and backing off exponentially. They are typed with `ParamSpec`, so a decorated function keeps its exact
+  signature for mypy. The idempotency key is generated **once, before the first attempt**, so every retry
+  reuses it and a retry can never apply a transfer twice. `create_account` has no key, so it is
+  deliberately *not* retried.
+- **async/await:** `AsyncLedgerClient.bulk_transfer(requests, concurrency=10)` runs many transfers at once
+  with `asyncio.gather`, a semaphore capping how many are in flight. Each request carries its own key, so
+  running the same batch twice applies nothing the second time.
+
+## Operations
+
+| File | What it is |
+|---|---|
+| `scripts/run_server.sh` | Starts the server and uses `trap` to forward `SIGTERM`/`SIGINT` to it, so it stops gracefully |
+| `scripts/graceful_shutdown_demo.sh` | Stops the server mid-request with `SIGTERM` and with `SIGKILL` and shows the difference (Linux/macOS/WSL) |
+| `scripts/load_test.sh` | `curl` + `xargs -P` fire parallel requests and check the promises hold: one key applied once, 200 concurrent withdrawals never overdraw |
+| `scripts/analyze_logs.sh` | A `grep`/`sed`/`awk`/`sort | uniq -c` pipeline that summarises the JSON logs: events, rejection reasons, money applied |
+| `deploy/ledger.service` | A hardened `systemd` unit (unprivileged dynamic user, read-only filesystem, state in `/var/lib/ledger`) |
+
+What the graceful-shutdown demo shows: on `SIGTERM` the in-flight deposit still completes (`201`) and is
+applied, new connections are refused, and the server exits with status `143` (128 + 15: uvicorn finishes its
+work and re-raises the signal, which `systemd` treats as a clean stop). On `SIGKILL` the process dies at once,
+the client gets no answer, and because the deposit never committed, nothing was applied.
+
+The scripts are checked with `shellcheck` and run in CI. The unit file passed `systemd-analyze verify`, but it
+has not been run under a real `systemd` here.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -170,18 +235,28 @@ requests with one key apply exactly once; opposing transfers don't deadlock or l
 and a crash-injection test (a failure after the balances change but before the row is written
 leaves everything untouched).
 
-CI (`.github/workflows/ci.yml`) runs lint, type checking and tests on Python 3.11 and 3.13,
-and builds the Docker image, on every push and pull request.
+CI (`.github/workflows/ci.yml`) runs on every push and pull request: lint, type checking and tests on
+Python 3.11 and 3.13; `shellcheck`, the load test against a real server, `ledger.reconcile`, and the
+graceful-shutdown demo on Linux; and a Docker image build with a smoke test.
 
 ## Project layout
 
 ```
 src/ledger/
-    db.py              schema, business rules, apply_transaction (all SQL lives here)
+    db.py              schema, business rules, apply_transaction, statement + reconcile SQL
     api.py             FastAPI app: validation, error-to-status mapping, log events
     logging_config.py  JSON log formatter
+    reconcile.py       `python -m ledger.reconcile` command
+src/ledger_client/
+    client.py          LedgerClient / AsyncLedgerClient (generators, bulk_transfer)
+    retry.py           retry_on_busy / async_retry_on_busy decorators
+    models.py          data types and typed errors
+scripts/             shell tooling: server wrapper, load test, log analysis, shutdown demo
+deploy/              systemd unit
 tests/
     test_api.py                     behaviour through HTTP
     test_db.py                      atomicity, concurrency and constraint tests below the HTTP layer
     test_limits_and_resilience.py   int64 limits, lock timeouts, slashless routes, logging
+    test_statement.py               statement (window function, join), query plans, reconcile
+    test_client.py                  the client: retry decorator, lazy generator, async bulk transfer
 ```

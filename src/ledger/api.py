@@ -84,6 +84,28 @@ class TransactionPage(BaseModel):
     )
 
 
+class StatementEntryOut(BaseModel):
+    transaction_id: int
+    transaction_type: TransactionType
+    amount: int
+    change: int = Field(description="Signed effect on this account: + money in, - money out")
+    balance_after: int = Field(description="This account's balance right after the transaction")
+    counterparty_id: int | None = Field(
+        description="The other account; null for deposits/withdrawals"
+    )
+    counterparty_name: str | None
+    timestamp: str
+
+
+class StatementPage(BaseModel):
+    account_id: int
+    closing_balance: int
+    items: list[StatementEntryOut]
+    next_cursor: int | None = Field(
+        description="Pass as ?cursor= to fetch the next page. Null on the last page."
+    )
+
+
 def _transaction_out(transaction: db.Transaction) -> TransactionOut:
     return TransactionOut(
         id=transaction.id,
@@ -129,6 +151,40 @@ def get_account(account_id: Annotated[int, Path(ge=1, le=MAX_INT64)]) -> Account
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
     return AccountOut(id=account.id, name=account.name, balance=account.balance)
+
+
+@app.get("/accounts/{account_id}/statement", response_model=StatementPage)
+def get_statement(
+    account_id: Annotated[int, Path(ge=1, le=MAX_INT64)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 10,
+    cursor: Annotated[
+        int | None,
+        Query(ge=1, le=MAX_INT64, description="`next_cursor` from the previous page"),
+    ] = None,
+) -> StatementPage:
+    """An account's transactions, newest first, each with the balance right after it."""
+    account = db.get_account(account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+    entries, next_cursor = db.get_statement(account_id, limit=limit, cursor=cursor)
+    return StatementPage(
+        account_id=account.id,
+        closing_balance=account.balance,
+        items=[
+            StatementEntryOut(
+                transaction_id=e.transaction_id,
+                transaction_type=e.transaction_type,
+                amount=e.amount,
+                change=e.change,
+                balance_after=e.balance_after,
+                counterparty_id=e.counterparty_id,
+                counterparty_name=e.counterparty_name,
+                timestamp=e.timestamp,
+            )
+            for e in entries
+        ],
+        next_cursor=next_cursor,
+    )
 
 
 # --------------------------------------------------------------------------- #

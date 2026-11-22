@@ -1,0 +1,46 @@
+# systemd unit for running the ledger on a Linux host.
+#
+# Install (adjust the paths to where you put the code and its virtualenv):
+#   sudo cp deploy/ledger.service /etc/systemd/system/ledger.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ledger
+#   journalctl -u ledger -o cat | ./scripts/analyze_logs.sh
+#   sudo systemctl stop ledger        # sends SIGTERM, waits up to TimeoutStopSec, then SIGKILL
+#
+# The service's JSON logs go to stderr, which systemd sends to the journal.
+
+[Unit]
+Description=Transaction ledger API
+After=network.target
+
+[Service]
+Type=simple
+
+# Run as a throwaway unprivileged user. StateDirectory= creates /var/lib/ledger owned by that
+# user, which is where the SQLite file lives. No home directory, no shell, nothing else writable.
+DynamicUser=yes
+StateDirectory=ledger
+Environment=LEDGER_DB_PATH=/var/lib/ledger/ledger.db
+Environment=LEDGER_LOG_LEVEL=INFO
+
+# One worker: SQLite allows a single writer, and extra workers would only queue for its lock.
+ExecStart=/opt/ledger/.venv/bin/uvicorn ledger.api:app --host 127.0.0.1 --port 8000
+
+# Stop gracefully: SIGTERM lets uvicorn finish in-flight requests. After TimeoutStopSec systemd
+# gives up waiting and sends SIGKILL, which is safe for the data (see scripts/graceful_shutdown_demo.sh).
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Restart if it crashes, but not if it was stopped on purpose.
+Restart=on-failure
+RestartSec=2
+
+# Hardening: the service cannot gain privileges, sees a read-only filesystem except its state
+# directory, and gets private /tmp and no access to home directories.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
