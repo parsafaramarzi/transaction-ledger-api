@@ -77,7 +77,12 @@ curl "localhost:8000/transactions/?account_id=1&limit=10"
 | `withdraw` | required | must be omitted | money leaves the source to outside |
 | `transfer` | required | required (different account) | money moves between two accounts |
 
-`amount` is a positive integer in minor units.
+`amount` is a positive integer in minor units, at most `1_000_000_000_000` per transaction. Ids must be
+positive and fit a signed 64-bit integer; balances are capped at 2⁶³ − 1. Anything outside these ranges is
+a `422`, never a server error, and a balance can never silently turn into a float.
+
+Collection routes work with or without the trailing slash (`/transactions` and `/transactions/`), and
+neither redirects.
 
 ### Status codes
 
@@ -87,7 +92,8 @@ curl "localhost:8000/transactions/?account_id=1&limit=10"
 | `200` | Idempotent replay: same key, same body. The original transaction is returned and nothing is applied again |
 | `404` | Unknown account |
 | `409` | Idempotency key reused with a **different** body |
-| `422` | Invalid request: bad type or amount, missing/empty `Idempotency-Key`, wrong source/destination for the type, or **insufficient funds** |
+| `422` | Invalid request: bad type, amount or id, missing/empty `Idempotency-Key`, wrong source/destination for the type, **insufficient funds**, or a credit that would push a balance past the maximum |
+| `503` | The ledger was busy (another writer held the database lock past the timeout). Nothing was applied; retry with the **same** key. Sent with `Retry-After: 1` |
 
 ### Idempotency
 
@@ -125,6 +131,32 @@ transaction opened with `BEGIN IMMEDIATE`**:
 - The schema backs this up even if application code has a bug: `CHECK (balance >= 0)`,
   `CHECK (amount > 0)`, `UNIQUE (idempotency_key)`, and foreign keys on both accounts.
 
+## Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LEDGER_DB_PATH` | `transaction_ledger.db` | Where the SQLite file lives (`/data/ledger.db` in Docker) |
+| `LEDGER_DB_TIMEOUT` | `10` | Seconds to wait for the write lock before answering `503` |
+| `LEDGER_LOG_LEVEL` | `INFO` | Log level for the `ledger` loggers |
+
+The schema is created on startup with `CREATE TABLE IF NOT EXISTS`, so an existing database file keeps its
+old schema. If you have a development database from an earlier version, delete it so the newer constraints
+(for example "a balance must be an integer") apply.
+
+## Logging
+
+Logs go to stderr as one JSON object per line:
+
+```json
+{"time": "...", "level": "INFO", "logger": "ledger.api", "event": "transaction_applied",
+ "idempotency_key": "transfer-001", "tx_type": "transfer", "amount": 250,
+ "source_id": 1, "destination_id": 2, "tx_id": 2}
+```
+
+Events: `transaction_applied`, `transaction_replayed`, `transaction_rejected` (with a `reason` such as
+`insufficient_funds`, `account_not_found`, `idempotency_conflict`, `busy`), and `account_created`. The
+idempotency key is the correlation id: search it to follow one logical request across retries.
+
 ## Development
 
 ```bash
@@ -145,9 +177,11 @@ and builds the Docker image, on every push and pull request.
 
 ```
 src/ledger/
-    db.py      schema, business rules, apply_transaction (all SQL lives here)
-    api.py     FastAPI app: validation and error-to-status mapping only
+    db.py              schema, business rules, apply_transaction (all SQL lives here)
+    api.py             FastAPI app: validation, error-to-status mapping, log events
+    logging_config.py  JSON log formatter
 tests/
-    test_api.py   behaviour through HTTP
-    test_db.py    atomicity, concurrency and constraint tests below the HTTP layer
+    test_api.py                     behaviour through HTTP
+    test_db.py                      atomicity, concurrency and constraint tests below the HTTP layer
+    test_limits_and_resilience.py   int64 limits, lock timeouts, slashless routes, logging
 ```

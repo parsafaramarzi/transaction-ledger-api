@@ -27,8 +27,15 @@ from typing import Literal
 
 TransactionType = Literal["deposit", "withdraw", "transfer"]
 
-# Read at call time (not bound into functions) so tests can monkeypatch it.
+# Read at call time (not bound into functions) so tests can monkeypatch them.
 DB_PATH: str = os.environ.get("LEDGER_DB_PATH", "transaction_ledger.db")
+BUSY_TIMEOUT: float = float(os.environ.get("LEDGER_DB_TIMEOUT", "10"))  # seconds to wait for a lock
+
+# SQLite integers are signed 64-bit. Anything beyond that is silently turned into a
+# float (balances) or raises OverflowError (bound parameters), so we bound everything.
+MAX_INT64 = 2**63 - 1
+MAX_BALANCE = MAX_INT64
+MAX_AMOUNT = 10**12  # per transaction, in minor units (10 billion major units)
 
 
 # --------------------------------------------------------------------------- #
@@ -52,6 +59,17 @@ class InvalidTransactionError(LedgerError):
 
 class IdempotencyConflictError(LedgerError):
     """An idempotency key was reused with a different request body."""
+
+
+class BalanceLimitExceededError(LedgerError):
+    """Crediting the destination would push its balance past ``MAX_BALANCE``."""
+
+
+class DatabaseBusyError(LedgerError):
+    """Another writer held the database lock for longer than ``BUSY_TIMEOUT``.
+
+    Safe to retry: nothing was applied.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -81,10 +99,15 @@ class Transaction:
 def get_connection() -> sqlite3.Connection:
     """Open a new connection. One per operation; never share across threads."""
     # isolation_level=None -> autocommit; transactions are managed explicitly.
-    conn = sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None)
+    conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
 
 
 @contextmanager
@@ -105,7 +128,8 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS accounts (
                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
                 name    TEXT    NOT NULL,
-                balance INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0)
+                balance INTEGER NOT NULL DEFAULT 0
+                    CHECK (typeof(balance) = 'integer' AND balance >= 0)
             )
             """
         )
@@ -158,7 +182,12 @@ def _transaction_from_row(row: sqlite3.Row) -> Transaction:
 def create_account(name: str) -> Account:
     """Create an account. The server assigns the id; the balance starts at 0."""
     with connection() as conn:
-        cur = conn.execute("INSERT INTO accounts (name, balance) VALUES (?, 0)", (name,))
+        try:
+            cur = conn.execute("INSERT INTO accounts (name, balance) VALUES (?, 0)", (name,))
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise DatabaseBusyError("The database is busy, retry shortly") from exc
+            raise
         return Account(id=int(cur.lastrowid or 0), name=name, balance=0)
 
 
@@ -179,6 +208,11 @@ def _validate_shape(
 ) -> None:
     if amount <= 0:
         raise InvalidTransactionError("Amount must be positive")
+    if amount > MAX_AMOUNT:
+        raise InvalidTransactionError(f"Amount must not exceed {MAX_AMOUNT}")
+    for account_id in (source_id, destination_id):
+        if account_id is not None and not 1 <= account_id <= MAX_INT64:
+            raise InvalidTransactionError("Account id is out of range")
     if transaction_type == "deposit":
         if source_id is not None or destination_id is None:
             raise InvalidTransactionError("A deposit needs a destination account and no source")
@@ -253,6 +287,8 @@ def apply_transaction(
         AccountNotFoundError: the source or destination account does not exist.
         InsufficientFundsError: the source account cannot cover the amount.
         IdempotencyConflictError: the key was used before with a different body.
+        BalanceLimitExceededError: the credit would overflow the destination balance.
+        DatabaseBusyError: the write lock was not available in time; safe to retry.
     """
     _validate_shape(transaction_type, amount, source_id, destination_id)
 
@@ -260,7 +296,12 @@ def apply_transaction(
     try:
         # Write lock up front: the idempotency check, balance check, balance
         # updates and insert below cannot interleave with another writer.
-        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise DatabaseBusyError("The database is busy, retry shortly") from exc
+            raise
 
         existing = _find_by_key(conn, idempotency_key)
         if existing is not None:
@@ -288,10 +329,14 @@ def apply_transaction(
             if cur.rowcount == 0:
                 raise InsufficientFundsError("Insufficient funds for the transaction")
         if destination_id is not None:
-            conn.execute(
-                "UPDATE accounts SET balance = balance + ? WHERE id = ?",
-                (amount, destination_id),
+            # Same idea for the credit: refuse rather than overflow int64. The account
+            # exists (checked above), so a miss here can only mean "would exceed the limit".
+            cur = conn.execute(
+                "UPDATE accounts SET balance = balance + ? WHERE id = ? AND balance <= ?",
+                (amount, destination_id, MAX_BALANCE - amount),
             )
+            if cur.rowcount == 0:
+                raise BalanceLimitExceededError("Destination balance would exceed the maximum")
 
         transaction = _insert_transaction(
             conn,
